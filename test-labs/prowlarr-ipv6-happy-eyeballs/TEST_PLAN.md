@@ -62,23 +62,20 @@ PR #2533 replaces the global flag with a proper implementation of the **Happy Ey
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Docker Compose Stack (dual-stack network)                      │
-│                                                                 │
-│  ┌──────────┐    DNS     ┌──────────────────────────────────┐   │
-│  │ dnsmasq  │◄───────────│         Prowlarr                 │   │
-│  │ (DNS)    │            │    (develop or PR #2533)          │   │
-│  └──────────┘            └──┬──────┬──────┬──────┬──────────┘   │
-│                             │      │      │      │              │
-│                     ┌───────┘      │      │      └───────┐      │
-│                     ▼              ▼      ▼              ▼      │
-│              ┌────────────┐ ┌──────────┐ ┌──────────┐ ┌──────┐  │
-│              │ v4only     │ │ v6only   │ │ dualstack│ │v6slow│  │
-│              │ (A only)   │ │(AAAA only│ │ (A+AAAA) │ │(slow)│  │
-│              └────────────┘ └──────────┘ └──────────┘ └──────┘  │
+│  Docker Compose Stack (dual-stack network: testnet)             │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │ tcpdump sidecar (captures Prowlarr's network traffic)    │   │
-│  └──────────────────────────────────────────────────────────┘   │
+│  │              Prowlarr (develop or PR #2533)               │   │
+│  │  /etc/hosts controls which address families resolve       │   │
+│  │  Port: 127.0.0.1:19696 -> 9696                           │   │
+│  └──┬──────────────┬──────────────┬─────────────────────────┘   │
+│     │              │              │                              │
+│     ▼              ▼              ▼                              │
+│  ┌──────────┐ ┌──────────┐ ┌──────────────┐  ┌──────────────┐  │
+│  │ v4only   │ │ v6only   │ │  dualstack   │  │   v6slow     │  │
+│  │ A only   │ │AAAA only │ │  A + AAAA    │  │ A+AAAA+500ms │  │
+│  │ :9117    │ │ :9117    │ │  :9117       │  │  :9117       │  │
+│  └──────────┘ └──────────┘ └──────────────┘  └──────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -86,20 +83,24 @@ PR #2533 replaces the global flag with a proper implementation of the **Happy Ey
 
 | Component | Image | Role | Network Config |
 |-----------|-------|------|----------------|
-| `dnsmasq` | `jpillora/dnsmasq` | Controlled DNS. Returns specific A/AAAA records per mock indexer hostname. | Dual-stack |
-| `indexer-v4only` | Custom Python | Mock Torznab indexer. Bound to IPv4 only. DNS returns A record only. | IPv4 only |
-| `indexer-v6only` | Custom Python | Mock Torznab indexer. Bound to dual-stack socket. DNS returns AAAA record only. | Dual-stack |
-| `indexer-dualstack` | Custom Python | Mock Torznab indexer. DNS returns both A and AAAA records. | Dual-stack |
+| `indexer-v4only` | Custom Python | Mock Torznab indexer. Bound to IPv4 only. `/etc/hosts` has A record only. | IPv4 only |
+| `indexer-v6only` | Custom Python | Mock Torznab indexer. Bound to dual-stack socket. `/etc/hosts` has AAAA record only. | Dual-stack |
+| `indexer-dualstack` | Custom Python | Mock Torznab indexer. `/etc/hosts` has both A and AAAA records. | Dual-stack |
 | `indexer-v6slow` | Custom Python | Mock Torznab indexer with 500ms artificial IPv6 latency via `tc netem`. | Dual-stack |
 | `prowlarr` | `linuxserver/prowlarr:develop` | The application under test. | Dual-stack |
-| `tcpdump` | `nicolaka/netshoot` | Packet capture sidecar sharing Prowlarr's network namespace. | Shares Prowlarr's network |
+
+### DNS Control
+
+We use Docker's `extra_hosts` directive on the Prowlarr container to inject `/etc/hosts` entries. This is simpler and more reliable than running a separate DNS container (dnsmasq had port conflicts in Docker-in-Docker and on Docker Desktop for Mac).
+
+The `/etc/hosts` approach gives us the same control: we decide exactly which address families each hostname resolves to.
 
 ### Network
 
 - **IPv4 subnet:** `172.30.0.0/24`
 - **IPv6 subnet:** `fd00:dead:beef::/64`
 - Docker's `enable_ipv6: true` flag is set on the bridge network.
-- Prowlarr's DNS is pointed at the dnsmasq container.
+- Hostname resolution is controlled via `extra_hosts` on the Prowlarr container.
 
 ### Mock Indexer Design
 
@@ -115,10 +116,10 @@ Each mock indexer is a Python HTTP server that:
 
 The address family classification is the primary observable. If a client connects from an IPv4 address, it logs `IPv4`. If from a native IPv6 address, it logs `IPv6`. If from an IPv4-mapped IPv6 address (`::ffff:x.x.x.x`), it logs `IPv4-mapped-IPv6` (which indicates the client used IPv4 but the server is on a dual-stack socket).
 
-### DNS Records
+### Host Entries (Prowlarr's /etc/hosts)
 
-| Hostname | A Record | AAAA Record | Purpose |
-|----------|----------|-------------|---------|
+| Hostname | IPv4 Entry | IPv6 Entry | Purpose |
+|----------|-----------|------------|---------|
 | `indexer-v4only.testlab.local` | `172.30.0.11` | (none) | Forces IPv4. Triggers the global disable in baseline. |
 | `indexer-v6only.testlab.local` | (none) | `fd00:dead:beef::12` | Only reachable via IPv6. Canary for the global disable. |
 | `indexer-dualstack.testlab.local` | `172.30.0.10` | `fd00:dead:beef::10` | Both available. Shows which family Prowlarr chooses. |
@@ -324,50 +325,89 @@ The Prowlarr build under test:
 ### Prerequisites
 
 - Docker and Docker Compose (v2+)
-- `git` for cloning the test lab
+- `sqlite3` CLI (for indexer configuration)
 - A system with IPv6 support enabled (check: `sysctl net.ipv6.conf.all.disable_ipv6` should return `0` on Linux, or verify via `ifconfig` on macOS)
-- Port 9696 available (Prowlarr web UI)
+- Port 19696 available (test Prowlarr web UI; avoids conflict with existing Prowlarr on 9696)
 
-### Running the Baseline
+### Step-by-Step
 
 ```bash
-# Clone and enter the test lab
+# 1. Build and start the stack
 cd prowlarr-ipv6-testlab
+docker compose build
+docker compose up -d
 
-# Launch the full stack and run the baseline test suite
-./launch.sh baseline
+# 2. Wait for Prowlarr to start (~15 seconds)
+#    Check: docker logs testlab-prowlarr 2>&1 | grep "Application started"
+
+# 3. Add indexers via SQLite DB injection
+#    (Prowlarr's API runs a test on creation that blocks IPv6-only indexers.
+#     Direct DB insertion bypasses this validation.)
+docker stop testlab-prowlarr
+docker cp testlab-prowlarr:/config/prowlarr.db /tmp/prowlarr-testlab.db
+
+sqlite3 /tmp/prowlarr-testlab.db "
+INSERT INTO Indexers (Name, Implementation, Settings, ConfigContract, Enable, Priority, Added, Redirect, AppProfileId, Tags, DownloadClientId)
+VALUES
+('TestLab-v4only', 'Torznab',
+ '{\"baseUrl\":\"http://indexer-v4only.testlab.local:9117\",\"apiPath\":\"/api\",\"apiKey\":\"testlab-mock-key\",\"torrentBaseSettings\":{}}',
+ 'TorznabSettings', 1, 10, datetime('now'), 0, 1, '[]', 0),
+('TestLab-v6only', 'Torznab',
+ '{\"baseUrl\":\"http://indexer-v6only.testlab.local:9117\",\"apiPath\":\"/api\",\"apiKey\":\"testlab-mock-key\",\"torrentBaseSettings\":{}}',
+ 'TorznabSettings', 1, 20, datetime('now'), 0, 1, '[]', 0),
+('TestLab-dualstack', 'Torznab',
+ '{\"baseUrl\":\"http://indexer-dualstack.testlab.local:9117\",\"apiPath\":\"/api\",\"apiKey\":\"testlab-mock-key\",\"torrentBaseSettings\":{}}',
+ 'TorznabSettings', 1, 30, datetime('now'), 0, 1, '[]', 0);
+"
+
+docker cp /tmp/prowlarr-testlab.db testlab-prowlarr:/config/prowlarr.db
+docker start testlab-prowlarr
+# Wait ~15 seconds for restart
+
+# 4. Get the API key
+docker exec testlab-prowlarr cat /config/config.xml | grep ApiKey
+
+# 5. Clear indexer logs
+for c in testlab-indexer-v4only testlab-indexer-v6only testlab-indexer-dualstack; do
+    docker exec "$c" sh -c 'truncate -s 0 /tmp/indexer-access.log 2>/dev/null || true'
+done
+
+# 6. Trigger a search
+API_KEY="<your-api-key>"
+docker exec testlab-prowlarr curl -sf \
+    "http://localhost:9696/api/v1/search?query=test+release&type=search" \
+    -H "X-Api-Key: $API_KEY" -o /dev/null -w "HTTP %{http_code}\n"
+
+# 7. Wait 5 seconds, collect results
+sleep 5
+for c in testlab-indexer-v4only testlab-indexer-v6only testlab-indexer-dualstack; do
+    echo "=== ${c} ==="
+    docker exec "$c" cat /tmp/indexer-access.log 2>/dev/null || echo "NO CONNECTIONS"
+done
+
+# 8. Check Prowlarr logs
+docker logs testlab-prowlarr 2>&1 | grep -i "ipv6\|ManagedHttp\|v6only"
 ```
-
-The launch script will:
-1. Build the mock indexer Docker image
-2. Start all containers (DNS, 4 indexers, Prowlarr develop, tcpdump)
-3. Verify DNS resolution from the Prowlarr container
-4. Verify mock indexers are responding
-5. Configure all indexers in Prowlarr via API
-6. Run all 6 test scenarios with restarts between each
-7. Output a results summary
 
 ### Running the Fix
 
-To test PR #2533, modify `docker-compose.yml` to build Prowlarr from the PR branch instead of using the `linuxserver/prowlarr:develop` image. Then:
-
-```bash
-./launch.sh fixed
-```
-
-### Comparing Results
-
-```bash
-# Analyze a specific run
-./scripts/check-results.sh results/baseline-YYYYMMDD-HHMMSS/
-./scripts/check-results.sh results/fixed-YYYYMMDD-HHMMSS/
-```
+To test PR #2533, build Prowlarr from the PR branch and create a custom Docker image, or modify `docker-compose.yml` to use a pre-built image from the PR. Then repeat steps 1-8.
 
 ### Cleanup
 
 ```bash
-./scripts/teardown.sh
+docker compose down -v --remove-orphans
 ```
+
+### Secondary Validation (GitHub Actions)
+
+A GitHub Actions workflow is available in the `Logvin/lab-notes` repository. Anyone can fork the repo and run the workflow to reproduce results independently:
+
+```
+.github/workflows/prowlarr-ipv6-test.yml
+```
+
+This runs the full baseline test on an Ubuntu runner with Docker IPv6 enabled.
 
 ---
 
@@ -419,5 +459,75 @@ The `address_family` field is the primary observable:
 | 5. IPv6-only environment | PASS (no IPv4 to fall back to) | PASS |
 | 6. Recovery after restart | PASS - restart resets flag | PASS - no flag to reset |
 
-If baseline results match the "Baseline" column, hypotheses H1 is confirmed and the bug is proven.
+If baseline results match the "Baseline" column, hypothesis H1 is confirmed and the bug is proven.
 If fixed results match the "Fixed" column, hypotheses H2, H3, and H4 are confirmed and the fix is validated.
+
+---
+
+## 9. Observed Results (Baseline)
+
+### Test Environment 1: macOS Docker Desktop (2026-03-27)
+
+**Prowlarr Version:** 2.3.4.5307 (develop)
+**Docker:** Docker Desktop for Mac 29.3.0
+
+#### Critical Finding: IPv6 Disabled on Startup
+
+IPv6 was globally disabled before any indexer was contacted. Prowlarr's first outbound connection (an update check to `prowlarr.servarr.com`) triggered the global kill switch on application startup:
+
+```
+[Info] ManagedHttpDispatcher: IPv4 is available: True, IPv6 will be disabled
+```
+
+This means the bug is even worse than described in the issue. It's not just "first indexer disables IPv6 for other indexers." The update check itself disables IPv6 before any user-configured indexer is ever contacted.
+
+#### Test 1 Results
+
+| Indexer | Connections | Address Family | Result |
+|---------|------------|----------------|--------|
+| TestLab-v4only | 2 | IPv4 | OK |
+| TestLab-v6only | **0** | N/A | **UNREACHABLE** |
+| TestLab-dualstack | 2 | IPv4-mapped-IPv6 (forced to IPv4) | Degraded |
+
+**H1 Confirmed.** The IPv6-only indexer received zero connections. The dual-stack indexer was forced to IPv4.
+
+#### Prowlarr Error Log for v6-only Indexer
+
+```
+System.Net.Http.HttpRequestException: No data available (indexer-v6only.testlab.local:9117)
+   at NzbDrone.Common.Http.Dispatchers.ManagedHttpDispatcher.attemptConnection(
+       AddressFamily addressFamily, SocketsHttpConnectionContext context, ...)
+   at NzbDrone.Common.Http.Dispatchers.ManagedHttpDispatcher.onConnect(...)
+```
+
+---
+
+## 10. Known Issues and Workarounds
+
+### Docker Desktop for Mac: Port Mapping with Dual-Stack Networks
+
+Docker Desktop for Mac (tested v29.3.0) fails to forward ports from the host to containers on networks with `enable_ipv6: true`. Port mapping shows as configured (`docker port` returns correct output) but connections from `127.0.0.1` are refused.
+
+**Workaround:** Use `docker exec` to run all API calls from inside the Prowlarr container rather than accessing the mapped port from the host. For UI access (Playwright screenshots), serve content from a separate HTTP server on the host.
+
+This issue does not affect Linux hosts (tested on Ubuntu 24.04).
+
+### Prowlarr API Validation Blocks Indexer Creation
+
+The Prowlarr API automatically tests indexers on creation (`POST /api/v1/indexer`). This test fails for our mock indexers because:
+1. Usenet (Newznab) indexers require `redirect=true` in newer Prowlarr versions
+2. Torznab indexers pass the connection test but fail search validation ("no results returned")
+
+**Workaround:** Inject indexers directly into Prowlarr's SQLite database, bypassing the API validation. Stop Prowlarr, modify the DB, restart. Required fields: `Name`, `Implementation`, `Settings` (JSON), `ConfigContract`, `Enable`, `Priority`, `Added`, `Redirect`, `AppProfileId`, `Tags`, `DownloadClientId`.
+
+### YAML Parsing of IPv6 Addresses
+
+Docker Compose YAML files parse `::` as a YAML mapping type, not a string. Environment variables containing `::` must be quoted:
+
+```yaml
+# Wrong (YAML parse error):
+- BIND_HOST=::
+
+# Correct:
+- "BIND_HOST=::"
+```

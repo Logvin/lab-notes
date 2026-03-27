@@ -1,0 +1,627 @@
+name: Prowlarr IPv6 Test Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_label:
+        description: "Label for this test run (e.g. baseline, patched, proxy-fix)"
+        required: false
+        default: "baseline"
+
+jobs:
+  prowlarr-ipv6-test:
+    name: "Prowlarr IPv6 [${{ github.event.inputs.test_label }}]"
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------
+      # a. Check out the repo
+      # -----------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------
+      # b. Create test lab directory structure and files
+      # -----------------------------------------------------------
+      - name: Create test lab files
+        run: |
+          LAB_DIR="${GITHUB_WORKSPACE}/prowlarr-ipv6-lab"
+          mkdir -p "${LAB_DIR}/mock-indexer"
+
+          # ---- mock-indexer/indexer.py ----
+          cat > "${LAB_DIR}/mock-indexer/indexer.py" << 'PYEOF'
+          import http.server
+          import json
+          import os
+          import sys
+          import time
+          from urllib.parse import urlparse, parse_qs
+
+          INDEXER_NAME = os.environ.get("INDEXER_NAME", "unknown")
+          BIND_HOST = os.environ.get("BIND_HOST", "::")
+          PORT = 9117
+          LOG_FILE = "/logs/access.log"
+
+          TORZNAB_CAPS = """<?xml version="1.0" encoding="UTF-8"?>
+          <caps>
+            <server version="1.0" title="{name}" />
+            <searching>
+              <search available="yes" supportedParams="q" />
+            </searching>
+            <categories>
+              <category id="2000" name="Movies" />
+              <category id="5000" name="TV" />
+            </categories>
+          </caps>""".format(name=INDEXER_NAME)
+
+          TORZNAB_SEARCH = """<?xml version="1.0" encoding="UTF-8"?>
+          <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+            <channel>
+              <title>{name}</title>
+              <item>
+                <title>TestResult.From.{name}.S01E01.720p</title>
+                <guid>urn:testlab:{name}:1</guid>
+                <link>http://localhost/fake.torrent</link>
+                <size>1073741824</size>
+                <torznab:attr name="seeders" value="50" />
+                <torznab:attr name="peers" value="100" />
+                <torznab:attr name="category" value="5000" />
+              </item>
+            </channel>
+          </rss>""".format(name=INDEXER_NAME)
+
+
+          def detect_address_family(addr):
+              if ":" in addr:
+                  if addr.startswith("::ffff:"):
+                      return "IPv4-mapped-IPv6"
+                  return "IPv6"
+              return "IPv4"
+
+
+          class IndexerHandler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  parsed = urlparse(self.path)
+                  params = parse_qs(parsed.query)
+                  action = params.get("t", ["unknown"])[0]
+
+                  client_ip = self.client_address[0]
+                  family = detect_address_family(client_ip)
+
+                  log_entry = {
+                      "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "indexer": INDEXER_NAME,
+                      "client_ip": client_ip,
+                      "address_family": family,
+                      "action": action,
+                      "path": self.path,
+                  }
+
+                  # Write to log file
+                  os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+                  with open(LOG_FILE, "a") as f:
+                      f.write(json.dumps(log_entry) + "\n")
+
+                  # Also print to stdout for debugging
+                  print(json.dumps(log_entry), flush=True)
+
+                  if action == "caps":
+                      body = TORZNAB_CAPS.encode()
+                  else:
+                      body = TORZNAB_SEARCH.encode()
+
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/xml")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, format, *args):
+                  # Suppress default stderr logging; we handle our own
+                  pass
+
+
+          if __name__ == "__main__":
+              print(f"[{INDEXER_NAME}] Starting on {BIND_HOST}:{PORT}", flush=True)
+              server = http.server.HTTPServer((BIND_HOST, PORT), IndexerHandler)
+              server.serve_forever()
+          PYEOF
+
+          # ---- mock-indexer/Dockerfile ----
+          cat > "${LAB_DIR}/mock-indexer/Dockerfile" << 'DKEOF'
+          FROM python:3.12-slim
+          WORKDIR /app
+          COPY indexer.py .
+          EXPOSE 9117
+          CMD ["python", "-u", "indexer.py"]
+          DKEOF
+
+          # ---- docker-compose.yml ----
+          cat > "${LAB_DIR}/docker-compose.yml" << 'DCEOF'
+          services:
+            indexer-v4only:
+              build: ./mock-indexer
+              container_name: indexer-v4only
+              environment:
+                - INDEXER_NAME=v4only
+                - BIND_HOST=0.0.0.0
+              volumes:
+                - v4only-logs:/logs
+              networks:
+                testnet:
+                  ipv4_address: 172.30.0.10
+
+            indexer-v6only:
+              build: ./mock-indexer
+              container_name: indexer-v6only
+              environment:
+                - INDEXER_NAME=v6only
+                - "BIND_HOST=::"
+              volumes:
+                - v6only-logs:/logs
+              networks:
+                testnet:
+                  ipv6_address: fd00:dead:beef::20
+
+            indexer-dualstack:
+              build: ./mock-indexer
+              container_name: indexer-dualstack
+              environment:
+                - INDEXER_NAME=dualstack
+                - "BIND_HOST=::"
+              volumes:
+                - dualstack-logs:/logs
+              networks:
+                testnet:
+                  ipv4_address: 172.30.0.30
+                  ipv6_address: fd00:dead:beef::30
+
+            prowlarr:
+              image: lscr.io/linuxserver/prowlarr:develop
+              container_name: prowlarr
+              environment:
+                - PUID=1000
+                - PGID=1000
+                - TZ=Etc/UTC
+              ports:
+                - "127.0.0.1:19696:9696"
+              extra_hosts:
+                - "indexer-v4only.testlab.local:172.30.0.10"
+                - "indexer-v6only.testlab.local:fd00:dead:beef::20"
+                - "indexer-dualstack.testlab.local:172.30.0.30"
+              volumes:
+                - prowlarr-config:/config
+              networks:
+                testnet:
+                  ipv4_address: 172.30.0.100
+                  ipv6_address: fd00:dead:beef::100
+              depends_on:
+                - indexer-v4only
+                - indexer-v6only
+                - indexer-dualstack
+
+          volumes:
+            v4only-logs:
+            v6only-logs:
+            dualstack-logs:
+            prowlarr-config:
+
+          networks:
+            testnet:
+              driver: bridge
+              enable_ipv6: true
+              ipam:
+                config:
+                  - subnet: 172.30.0.0/24
+                  - subnet: fd00:dead:beef::/64
+          DCEOF
+
+          echo "Test lab files created in ${LAB_DIR}"
+          ls -R "${LAB_DIR}"
+
+      # -----------------------------------------------------------
+      # c. Enable Docker IPv6 support
+      # -----------------------------------------------------------
+      - name: Enable Docker IPv6
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:db8:1::/64",
+            "experimental": true,
+            "ip6tables": true
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # Verify IPv6 is enabled
+          docker info 2>/dev/null | grep -i ipv6 || echo "IPv6 info not shown (ok on some versions)"
+
+      # -----------------------------------------------------------
+      # d. Build and start the stack
+      # -----------------------------------------------------------
+      - name: Build and start containers
+        working-directory: prowlarr-ipv6-lab
+        run: |
+          docker compose build
+          docker compose up -d
+          echo "Containers started:"
+          docker compose ps
+
+      # -----------------------------------------------------------
+      # e. Wait for Prowlarr to be ready
+      # -----------------------------------------------------------
+      - name: Wait for Prowlarr readiness
+        run: |
+          echo "Waiting for Prowlarr to start (up to 120s)..."
+          TIMEOUT=120
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:19696/ping 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Prowlarr is ready after ${ELAPSED}s"
+              break
+            fi
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+            echo "  ...waiting (${ELAPSED}s, last HTTP code: ${HTTP_CODE})"
+          done
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "ERROR: Prowlarr did not become ready within ${TIMEOUT}s"
+            docker logs prowlarr 2>&1 | tail -50
+            exit 1
+          fi
+
+      # -----------------------------------------------------------
+      # f. Add indexers via SQLite DB injection
+      # -----------------------------------------------------------
+      - name: Retrieve Prowlarr API key
+        id: apikey
+        run: |
+          # Copy the DB out of the container
+          docker cp prowlarr:/config/prowlarr.db /tmp/prowlarr.db
+
+          API_KEY=$(sqlite3 /tmp/prowlarr.db "SELECT Value FROM Config WHERE Key='ApiKey';")
+          echo "API_KEY=${API_KEY}" >> "$GITHUB_OUTPUT"
+          echo "Prowlarr API key retrieved"
+
+      - name: Inject indexers into Prowlarr DB
+        run: |
+          # Stop Prowlarr so we can safely write to the DB
+          docker stop prowlarr
+
+          # Copy DB out
+          docker cp prowlarr:/config/prowlarr.db /tmp/prowlarr.db
+
+          # Insert indexers
+          sqlite3 /tmp/prowlarr.db << 'SQL'
+          INSERT INTO Indexers (Name, Implementation, ConfigContract, Settings, EnableRss, EnableAutomaticSearch, EnableInteractiveSearch, Priority, Added, AppProfileId)
+          VALUES (
+            'TestLab-v4only',
+            'Torznab',
+            'TorznabSettings',
+            '{"baseUrl": "http://indexer-v4only.testlab.local:9117", "apiPath": "/api", "apiKey": "testkey", "categories": [2000,5000]}',
+            1, 1, 1, 10,
+            datetime('now'),
+            1
+          );
+
+          INSERT INTO Indexers (Name, Implementation, ConfigContract, Settings, EnableRss, EnableAutomaticSearch, EnableInteractiveSearch, Priority, Added, AppProfileId)
+          VALUES (
+            'TestLab-v6only',
+            'Torznab',
+            'TorznabSettings',
+            '{"baseUrl": "http://indexer-v6only.testlab.local:9117", "apiPath": "/api", "apiKey": "testkey", "categories": [2000,5000]}',
+            1, 1, 1, 20,
+            datetime('now'),
+            1
+          );
+
+          INSERT INTO Indexers (Name, Implementation, ConfigContract, Settings, EnableRss, EnableAutomaticSearch, EnableInteractiveSearch, Priority, Added, AppProfileId)
+          VALUES (
+            'TestLab-dualstack',
+            'Torznab',
+            'TorznabSettings',
+            '{"baseUrl": "http://indexer-dualstack.testlab.local:9117", "apiPath": "/api", "apiKey": "testkey", "categories": [2000,5000]}',
+            1, 1, 1, 30,
+            datetime('now'),
+            1
+          );
+          SQL
+
+          echo "Indexers inserted. Verifying:"
+          sqlite3 /tmp/prowlarr.db "SELECT Id, Name, Priority FROM Indexers;"
+
+          # Copy DB back and restart
+          docker cp /tmp/prowlarr.db prowlarr:/config/prowlarr.db
+          docker start prowlarr
+
+          # Wait for Prowlarr to come back
+          echo "Waiting for Prowlarr to restart..."
+          TIMEOUT=90
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:19696/ping 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Prowlarr restarted after ${ELAPSED}s"
+              break
+            fi
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+          done
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "ERROR: Prowlarr did not restart within ${TIMEOUT}s"
+            docker logs prowlarr 2>&1 | tail -30
+            exit 1
+          fi
+
+      # -----------------------------------------------------------
+      # g. Clear indexer logs
+      # -----------------------------------------------------------
+      - name: Clear indexer access logs
+        run: |
+          docker exec indexer-v4only sh -c "rm -f /logs/access.log && touch /logs/access.log"
+          docker exec indexer-v6only sh -c "rm -f /logs/access.log && touch /logs/access.log"
+          docker exec indexer-dualstack sh -c "rm -f /logs/access.log && touch /logs/access.log"
+          echo "Indexer logs cleared"
+
+      # -----------------------------------------------------------
+      # h. Trigger a search via Prowlarr API
+      # -----------------------------------------------------------
+      - name: Trigger Prowlarr search
+        env:
+          API_KEY: ${{ steps.apikey.outputs.API_KEY }}
+        run: |
+          echo "Triggering search via Prowlarr API..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            "http://127.0.0.1:19696/api/v1/search?query=test&type=search" \
+            -H "X-Api-Key: ${API_KEY}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "HTTP Status: ${HTTP_CODE}"
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Search triggered successfully"
+            RESULT_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "unknown")
+            echo "Results returned: ${RESULT_COUNT}"
+          else
+            echo "WARNING: Search returned HTTP ${HTTP_CODE}"
+            echo "$BODY" | head -20
+          fi
+
+      # -----------------------------------------------------------
+      # i. Wait and collect indexer access logs
+      # -----------------------------------------------------------
+      - name: Collect indexer logs
+        id: indexer_logs
+        run: |
+          echo "Waiting 5s for requests to complete..."
+          sleep 5
+
+          RESULTS_DIR="${GITHUB_WORKSPACE}/results"
+          mkdir -p "${RESULTS_DIR}"
+
+          echo "--- v4only indexer log ---"
+          docker exec indexer-v4only cat /logs/access.log 2>/dev/null | tee "${RESULTS_DIR}/v4only-access.log" || echo "(empty)"
+
+          echo ""
+          echo "--- v6only indexer log ---"
+          docker exec indexer-v6only cat /logs/access.log 2>/dev/null | tee "${RESULTS_DIR}/v6only-access.log" || echo "(empty)"
+
+          echo ""
+          echo "--- dualstack indexer log ---"
+          docker exec indexer-dualstack cat /logs/access.log 2>/dev/null | tee "${RESULTS_DIR}/dualstack-access.log" || echo "(empty)"
+
+          # Count connections per indexer
+          V4_COUNT=$(wc -l < "${RESULTS_DIR}/v4only-access.log" 2>/dev/null | tr -d ' ' || echo "0")
+          V6_COUNT=$(wc -l < "${RESULTS_DIR}/v6only-access.log" 2>/dev/null | tr -d ' ' || echo "0")
+          DS_COUNT=$(wc -l < "${RESULTS_DIR}/dualstack-access.log" 2>/dev/null | tr -d ' ' || echo "0")
+
+          echo "V4_COUNT=${V4_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "V6_COUNT=${V6_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "DS_COUNT=${DS_COUNT}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------
+      # j. Collect Prowlarr logs
+      # -----------------------------------------------------------
+      - name: Collect Prowlarr logs
+        run: |
+          RESULTS_DIR="${GITHUB_WORKSPACE}/results"
+          docker logs prowlarr 2>&1 > "${RESULTS_DIR}/prowlarr-full.log"
+          docker logs prowlarr 2>&1 | grep -iE "ipv6|error|fail|refused|timeout|unreachable|v6only|dualstack|v4only" > "${RESULTS_DIR}/prowlarr-filtered.log" || true
+          echo "--- Prowlarr filtered log ---"
+          cat "${RESULTS_DIR}/prowlarr-filtered.log" || echo "(no matching entries)"
+
+      # -----------------------------------------------------------
+      # k. Generate results summary
+      # -----------------------------------------------------------
+      - name: Generate results summary
+        env:
+          TEST_LABEL: ${{ github.event.inputs.test_label }}
+          V4_COUNT: ${{ steps.indexer_logs.outputs.V4_COUNT }}
+          V6_COUNT: ${{ steps.indexer_logs.outputs.V6_COUNT }}
+          DS_COUNT: ${{ steps.indexer_logs.outputs.DS_COUNT }}
+        run: |
+          RESULTS_DIR="${GITHUB_WORKSPACE}/results"
+
+          # Analyze address families used
+          V4_FAMILIES=""
+          V6_FAMILIES=""
+          DS_FAMILIES=""
+
+          if [ -s "${RESULTS_DIR}/v4only-access.log" ]; then
+            V4_FAMILIES=$(python3 -c "
+          import json, sys
+          families = set()
+          for line in open('${RESULTS_DIR}/v4only-access.log'):
+              line = line.strip()
+              if line:
+                  try:
+                      entry = json.loads(line)
+                      families.add(entry.get('address_family', 'unknown'))
+                  except: pass
+          print(', '.join(sorted(families)) if families else 'none')
+          ")
+          else
+            V4_FAMILIES="none (no connections)"
+          fi
+
+          if [ -s "${RESULTS_DIR}/v6only-access.log" ]; then
+            V6_FAMILIES=$(python3 -c "
+          import json, sys
+          families = set()
+          for line in open('${RESULTS_DIR}/v6only-access.log'):
+              line = line.strip()
+              if line:
+                  try:
+                      entry = json.loads(line)
+                      families.add(entry.get('address_family', 'unknown'))
+                  except: pass
+          print(', '.join(sorted(families)) if families else 'none')
+          ")
+          else
+            V6_FAMILIES="none (no connections)"
+          fi
+
+          if [ -s "${RESULTS_DIR}/dualstack-access.log" ]; then
+            DS_FAMILIES=$(python3 -c "
+          import json, sys
+          families = set()
+          for line in open('${RESULTS_DIR}/dualstack-access.log'):
+              line = line.strip()
+              if line:
+                  try:
+                      entry = json.loads(line)
+                      families.add(entry.get('address_family', 'unknown'))
+                  except: pass
+          print(', '.join(sorted(families)) if families else 'none')
+          ")
+          else
+            DS_FAMILIES="none (no connections)"
+          fi
+
+          # Determine PASS/FAIL
+          # v4only: PASS if connections > 0 via IPv4
+          if [ "${V4_COUNT}" -gt 0 ]; then
+            V4_RESULT="PASS"
+            V4_EMOJI="✅"
+            V4_NOTE="Connections via IPv4 as expected"
+          else
+            V4_RESULT="FAIL"
+            V4_EMOJI="❌"
+            V4_NOTE="No connections received (unexpected)"
+          fi
+
+          # v6only: baseline expects FAIL (0 connections = confirms IPv6 bug)
+          if [ "${V6_COUNT}" -eq 0 ]; then
+            V6_RESULT="FAIL (expected)"
+            V6_EMOJI="🐛"
+            V6_NOTE="ZERO connections. Confirms Prowlarr IPv6 bug."
+          else
+            V6_RESULT="PASS"
+            V6_EMOJI="✅"
+            V6_NOTE="Connections received via: ${V6_FAMILIES}"
+          fi
+
+          # dualstack: connections via IPv4 only = degraded, IPv6 present = pass
+          if [ "${DS_COUNT}" -gt 0 ]; then
+            if echo "${DS_FAMILIES}" | grep -q "IPv6"; then
+              DS_RESULT="PASS"
+              DS_EMOJI="✅"
+              DS_NOTE="Dual-stack working. Families: ${DS_FAMILIES}"
+            else
+              DS_RESULT="DEGRADED"
+              DS_EMOJI="⚠️"
+              DS_NOTE="Connections via IPv4 only. No IPv6 usage."
+            fi
+          else
+            DS_RESULT="FAIL"
+            DS_EMOJI="❌"
+            DS_NOTE="No connections received (unexpected)"
+          fi
+
+          # Write summary file
+          cat > "${RESULTS_DIR}/summary.txt" << SUMEOF
+          ================================================
+          Prowlarr IPv6 Test Lab Results
+          Label: ${TEST_LABEL}
+          Date:  $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Run:   ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          ================================================
+
+          INDEXER           CONNECTIONS  FAMILIES                RESULT
+          -------           -----------  --------                ------
+          v4only            ${V4_COUNT}            ${V4_FAMILIES}  ${V4_RESULT}
+          v6only            ${V6_COUNT}            ${V6_FAMILIES}  ${V6_RESULT}
+          dualstack         ${DS_COUNT}            ${DS_FAMILIES}  ${DS_RESULT}
+
+          NOTES:
+          - v4only:     ${V4_NOTE}
+          - v6only:     ${V6_NOTE}
+          - dualstack:  ${DS_NOTE}
+
+          EXPECTED BASELINE BEHAVIOR:
+          - v4only:     Connections via IPv4 (PASS)
+          - v6only:     ZERO connections (FAIL - confirms IPv6 bug)
+          - dualstack:  Connections via IPv4 only (DEGRADED)
+          ================================================
+          SUMEOF
+
+          cat "${RESULTS_DIR}/summary.txt"
+
+          # Write GitHub Step Summary
+          cat >> "$GITHUB_STEP_SUMMARY" << MDEOF
+          ## Prowlarr IPv6 Test Lab Results
+
+          **Test label:** \`${TEST_LABEL}\`
+          **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          ### Results
+
+          | Indexer | Connections | Address Families | Result |
+          |---------|-------------|-----------------|--------|
+          | v4only | ${V4_COUNT} | ${V4_FAMILIES} | ${V4_EMOJI} ${V4_RESULT} |
+          | v6only | ${V6_COUNT} | ${V6_FAMILIES} | ${V6_EMOJI} ${V6_RESULT} |
+          | dualstack | ${DS_COUNT} | ${DS_FAMILIES} | ${DS_EMOJI} ${DS_RESULT} |
+
+          ### Details
+
+          - **v4only:** ${V4_NOTE}
+          - **v6only:** ${V6_NOTE}
+          - **dualstack:** ${DS_NOTE}
+
+          ### Expected Baseline Behavior
+          - **v4only:** Connections via IPv4 (PASS)
+          - **v6only:** ZERO connections (FAIL - confirms Prowlarr IPv6 bug)
+          - **dualstack:** Connections via IPv4 only (DEGRADED - no IPv6 attempted)
+
+          ---
+          <details>
+          <summary>Prowlarr filtered logs</summary>
+
+          \`\`\`
+          $(cat "${RESULTS_DIR}/prowlarr-filtered.log" 2>/dev/null || echo "(no matching entries)")
+          \`\`\`
+
+          </details>
+          MDEOF
+
+      # -----------------------------------------------------------
+      # l. Upload results as workflow artifact
+      # -----------------------------------------------------------
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prowlarr-ipv6-results-${{ github.event.inputs.test_label }}-${{ github.run_number }}
+          path: results/
+          retention-days: 90
+
+      # -----------------------------------------------------------
+      # Cleanup
+      # -----------------------------------------------------------
+      - name: Tear down containers
+        if: always()
+        working-directory: prowlarr-ipv6-lab
+        run: |
+          docker compose logs > "${GITHUB_WORKSPACE}/results/docker-compose-all.log" 2>&1 || true
+          docker compose down -v || true
