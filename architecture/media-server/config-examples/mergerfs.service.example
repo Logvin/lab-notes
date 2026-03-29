@@ -1,0 +1,90 @@
+# /etc/systemd/system/mergerfs.service
+#
+# MergerFS union mount that combines local storage and cloud rclone mounts
+# into a single filesystem for Plex and other media applications.
+#
+# Depends on:
+#   - All rclone mount services (gdrive, backblaze, blomp)
+#   - prepare-for-mergerfs.service (delay to let mounts initialize)
+#
+# Boot chain:
+#   network-online.target
+#     -> rclone-gdrive.service
+#     -> rclone-backblaze.service
+#     -> rclone-blomp.service
+#     -> prepare-for-mergerfs.service (10s delay)
+#       -> mergerfs.service (this file)
+#         -> plexdrive-shared.service (mount --make-rshared)
+
+[Unit]
+Description=MergerFS union mount for media
+After=prepare-for-mergerfs.service
+Requires=prepare-for-mergerfs.service
+
+[Service]
+Type=forking
+
+# Clean up stale FUSE mount (dash prefix = don't fail if nothing mounted)
+ExecStartPre=-/bin/fusermount -uz /local/storage/plexdrive
+
+# Mount with all branches
+# NC = No Create (read-only for new files)
+# RW = Read-Write (new files go here)
+# category.create=ff means "first found" - writes go to the first RW branch (local)
+ExecStart=/usr/bin/mergerfs \
+    -o use_ino \
+    -o allow_other \
+    -o func.getattr=newest \
+    -o category.create=ff \
+    -o cache.files=auto-full \
+    -o cache.readdir=true \
+    -o cache.attr=30 \
+    -o cache.entry=30 \
+    -o dropcacheonclose=true \
+    /local/storage/mounts/backblaze=NC:/local/storage/mounts/gdrive=NC:/local/storage/mounts/blomp=NC:/local/storage/mounts/local=RW \
+    /local/storage/plexdrive
+
+ExecStop=/bin/fusermount -uz /local/storage/plexdrive
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+
+# --- prepare-for-mergerfs.service ---
+# Place this in /etc/systemd/system/prepare-for-mergerfs.service
+#
+# [Unit]
+# Description=Wait for rclone mounts before starting MergerFS
+# After=rclone-gdrive.service rclone-backblaze.service rclone-blomp.service
+# Requires=rclone-gdrive.service rclone-backblaze.service rclone-blomp.service
+#
+# [Service]
+# Type=oneshot
+# ExecStart=/bin/sleep 10
+# RemainAfterExit=yes
+#
+# [Install]
+# WantedBy=multi-user.target
+
+
+# --- plexdrive-shared.service ---
+# Place this in /etc/systemd/system/plexdrive-shared.service
+#
+# Makes the MergerFS mount visible inside Docker containers via bind mounts.
+# Without this, containers see an empty directory instead of the FUSE mount.
+#
+# [Unit]
+# Description=Make plexdrive mount shared for Docker
+# After=mergerfs.service
+# Requires=mergerfs.service
+#
+# [Service]
+# Type=oneshot
+# ExecStart=/bin/mount --make-rshared /local/storage/plexdrive
+# RemainAfterExit=yes
+#
+# [Install]
+# WantedBy=multi-user.target

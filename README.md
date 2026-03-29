@@ -5,10 +5,17 @@ Test plans, research notes, and lab documentation for OSS contributions and pers
 ## Structure
 
 ```
+architecture/       # System architecture guides and reference designs
 test-labs/          # Reproducible test environments and plans
 research/           # Deep-dives and analysis
 contributions/      # Notes on OSS contributions
 ```
+
+## Architecture Guides
+
+| Guide | Description |
+|-------|-------------|
+| [Media Server](architecture/media-server/) | Production home media server with automated download pipeline, multi-cloud encrypted storage, and zero-trust web access |
 
 ## Test Labs
 

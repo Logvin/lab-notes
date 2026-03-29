@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# extract-and-transfer.sh
+#
+# Runs on the SEEDBOX. Scans qBittorrent for completed downloads,
+# extracts RAR archives if present, and rsyncs to the media server.
+#
+# Three phases:
+#   1. SCAN  - Query qBittorrent API for completed downloads
+#   2. STAGE - Extract RARs to a staging directory
+#   3. TRANSFER - rsync staged files to media server
+#
+# Cron: */10 * * * * /home/seeduser/scripts/extract-and-transfer.sh >> /home/seeduser/logs/pipeline.log 2>&1
+#
+# Dependencies: curl, jq, unrar, rsync
+#
+# SANITIZATION NOTE: All IPs, hostnames, and paths use placeholder values.
+# Adapt to your actual infrastructure.
+
+set -euo pipefail
+
+# ============================================================
+# Configuration
+# ============================================================
+QBIT_HOST="localhost"
+QBIT_PORT="8080"
+QBIT_USER="admin"
+QBIT_PASS="CHANGE_ME"
+
+MEDIA_SERVER="192.0.2.10"
+RSYNC_MODULE="staging"
+RSYNC_USER="mediauser"
+
+DOWNLOAD_DIR="/home/seeduser/downloads"
+STAGING_DIR="/home/seeduser/staging"
+PROCESSED_FILE="/home/seeduser/.processed_torrents"
+LOG_PREFIX="[$(date '+%Y-%m-%d %H:%M:%S')]"
+
+CATEGORIES=("sonarr" "radarr")
+
+# ============================================================
+# Functions
+# ============================================================
+log() {
+    echo "${LOG_PREFIX} $*"
+}
+
+die() {
+    log "FATAL: $*"
+    exit 1
+}
+
+# Authenticate with qBittorrent and get session cookie
+qbit_login() {
+    local cookie
+    cookie=$(curl -s -c - \
+        "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/auth/login" \
+        -d "username=${QBIT_USER}&password=${QBIT_PASS}" \
+        2>/dev/null | grep -o 'SID\s\+\S\+' | awk '{print $2}')
+
+    if [ -z "${cookie}" ]; then
+        die "Failed to authenticate with qBittorrent"
+    fi
+    echo "${cookie}"
+}
+
+# Get completed torrents for a category
+get_completed() {
+    local sid="$1"
+    local category="$2"
+
+    curl -s \
+        -b "SID=${sid}" \
+        "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/torrents/info?filter=completed&category=${category}" \
+        2>/dev/null
+}
+
+# Check if a torrent has already been processed
+is_processed() {
+    local hash="$1"
+    if [ -f "${PROCESSED_FILE}" ]; then
+        grep -q "^${hash}$" "${PROCESSED_FILE}" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+# Mark a torrent as processed
+mark_processed() {
+    local hash="$1"
+    echo "${hash}" >> "${PROCESSED_FILE}"
+}
+
+# Extract RAR archives from a directory
+extract_rars() {
+    local source_dir="$1"
+    local dest_dir="$2"
+
+    # Find the first .rar file (could be part of a split archive)
+    local rar_file
+    rar_file=$(find "${source_dir}" -maxdepth 2 -name "*.rar" -print -quit 2>/dev/null)
+
+    if [ -n "${rar_file}" ]; then
+        log "  Extracting: ${rar_file}"
+        mkdir -p "${dest_dir}"
+        unrar x -o+ "${rar_file}" "${dest_dir}/" > /dev/null 2>&1
+        return $?
+    fi
+
+    return 1  # No RAR files found
+}
+
+# Copy non-RAR media files directly
+copy_media_files() {
+    local source_dir="$1"
+    local dest_dir="$2"
+
+    mkdir -p "${dest_dir}"
+
+    # Copy common media file types
+    find "${source_dir}" -maxdepth 2 \
+        \( -name "*.mkv" -o -name "*.mp4" -o -name "*.avi" -o -name "*.srt" -o -name "*.nfo" \) \
+        -exec cp -n {} "${dest_dir}/" \; 2>/dev/null
+}
+
+# ============================================================
+# Health Checks
+# ============================================================
+log "Starting pipeline run"
+
+# Check seedbox disk usage
+DISK_USAGE=$(df --output=pcent /home/seeduser | tail -1 | tr -d ' %')
+if [ "${DISK_USAGE}" -gt 90 ]; then
+    log "WARNING: Seedbox disk usage at ${DISK_USAGE}%"
+    # Optionally pause all torrents
+    # curl -s "http://${QBIT_HOST}:${QBIT_PORT}/api/v2/torrents/pause?hashes=all"
+fi
+
+# Check media server is reachable
+if ! rsync "rsync://${RSYNC_USER}@${MEDIA_SERVER}/" > /dev/null 2>&1; then
+    die "Cannot reach media server rsync daemon at ${MEDIA_SERVER}"
+fi
+
+# ============================================================
+# Phase 1: SCAN
+# ============================================================
+log "Phase 1: Scanning qBittorrent for completed downloads"
+
+SID=$(qbit_login)
+WORK_DONE=false
+
+for category in "${CATEGORIES[@]}"; do
+    log "Checking category: ${category}"
+
+    COMPLETED=$(get_completed "${SID}" "${category}")
+
+    if [ -z "${COMPLETED}" ] || [ "${COMPLETED}" = "[]" ]; then
+        log "  No completed downloads in ${category}"
+        continue
+    fi
+
+    # Parse each torrent
+    echo "${COMPLETED}" | jq -r '.[] | "\(.hash)\t\(.name)\t\(.content_path)"' | while IFS=$'\t' read -r hash name content_path; do
+
+        # Skip already-processed torrents
+        if is_processed "${hash}"; then
+            continue
+        fi
+
+        log "  Processing: ${name} (${hash:0:8}...)"
+
+        # ============================================================
+        # Phase 2: STAGE
+        # ============================================================
+        STAGE_PATH="${STAGING_DIR}/${category}/${name}"
+
+        # Try extracting RARs first
+        if extract_rars "${content_path}" "${STAGE_PATH}"; then
+            log "  Extracted RARs to staging"
+        else
+            # No RARs - copy media files directly
+            log "  No RARs found, copying media files"
+            copy_media_files "${content_path}" "${STAGE_PATH}"
+        fi
+
+        # Verify we have something to transfer
+        FILE_COUNT=$(find "${STAGE_PATH}" -type f 2>/dev/null | wc -l)
+        if [ "${FILE_COUNT}" -eq 0 ]; then
+            log "  WARNING: No files staged for ${name}, skipping"
+            continue
+        fi
+
+        log "  Staged ${FILE_COUNT} files"
+
+        # ============================================================
+        # Phase 3: TRANSFER
+        # ============================================================
+        log "  Transferring to media server..."
+
+        if rsync -avP --remove-source-files \
+            "${STAGE_PATH}/" \
+            "rsync://${RSYNC_USER}@${MEDIA_SERVER}/${RSYNC_MODULE}/${category}/${name}/" \
+            > /dev/null 2>&1; then
+
+            log "  Transfer complete"
+            mark_processed "${hash}"
+            WORK_DONE=true
+
+            # Clean up empty staging directory
+            rmdir "${STAGE_PATH}" 2>/dev/null || true
+        else
+            log "  ERROR: rsync failed for ${name}"
+        fi
+
+    done
+done
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+# Remove empty directories from staging
+find "${STAGING_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+if [ "${WORK_DONE}" = true ]; then
+    log "Pipeline run complete (work done)"
+else
+    log "Pipeline run complete (nothing to do)"
+fi

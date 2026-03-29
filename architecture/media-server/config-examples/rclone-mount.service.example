@@ -1,0 +1,96 @@
+# /etc/systemd/system/rclone-gdrive.service
+#
+# systemd service for mounting an rclone encrypted Google Drive remote as a FUSE filesystem.
+# Runs as the media service user. Starts after network is available.
+#
+# Adapt remote name, paths, and cache settings for each backend.
+# Create one service file per cloud backend (rclone-gdrive, rclone-backblaze, rclone-blomp, etc.)
+
+[Unit]
+Description=rclone FUSE mount - Google Drive (encrypted)
+After=network-online.target
+Wants=network-online.target
+# If this mount fails, don't block other services
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+User=mediauser
+Group=mediagroup
+
+# Clean up stale FUSE mount if present (dash prefix = don't fail if nothing to unmount)
+ExecStartPre=-/bin/fusermount -uz /local/storage/mounts/gdrive
+
+ExecStart=/usr/bin/rclone mount gdrive-crypt: /local/storage/mounts/gdrive \
+    --config /local/storage/rclone.conf \
+    --allow-other \
+    --dir-cache-time 72h \
+    --vfs-cache-mode full \
+    --vfs-cache-max-size 80G \
+    --vfs-cache-max-age 1h \
+    --vfs-read-ahead 128M \
+    --buffer-size 64M \
+    --poll-interval 15s \
+    --log-file /local/storage/logs/rclone-gdrive.log \
+    --log-level INFO \
+    --cache-dir /local/storage/cache/gdrive \
+    --umask 002
+
+ExecStop=/bin/fusermount -uz /local/storage/mounts/gdrive
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+
+# --- Backblaze B2 variant ---
+# Key differences from Google Drive:
+#   - Remote name: backcrypt:
+#   - Mount path: /local/storage/mounts/backblaze
+#   - Smaller cache (10G) since it's a secondary backend
+#   - Different log file
+#
+# ExecStart=/usr/bin/rclone mount backcrypt: /local/storage/mounts/backblaze \
+#     --config /local/storage/rclone.conf \
+#     --allow-other \
+#     --dir-cache-time 72h \
+#     --vfs-cache-mode full \
+#     --vfs-cache-max-size 10G \
+#     --vfs-cache-max-age 1h \
+#     --vfs-read-ahead 128M \
+#     --buffer-size 64M \
+#     --poll-interval 15s \
+#     --log-file /local/storage/logs/rclone-backblaze.log \
+#     --log-level INFO \
+#     --umask 002
+#
+# Optionally enable rclone remote control API for cache management:
+#     --rc \
+#     --rc-addr localhost:5572 \
+#     --rc-no-auth
+
+
+# --- Blomp/Swift variant ---
+# Key differences:
+#   - Remote name: blomp-crypt: (crypt over chunker over Swift)
+#   - Mount path: /local/storage/mounts/blomp
+#   - Smaller cache (10G), shorter cache age (30m) due to chunker overhead
+#   - Minimal VFS cache mode (chunker + crypt + full cache = high I/O)
+#
+# ExecStart=/usr/bin/rclone mount blomp-crypt: /local/storage/mounts/blomp \
+#     --config /local/storage/rclone.conf \
+#     --allow-other \
+#     --dir-cache-time 72h \
+#     --vfs-cache-mode minimal \
+#     --vfs-cache-max-size 10G \
+#     --vfs-cache-max-age 30m \
+#     --vfs-read-ahead 128M \
+#     --buffer-size 64M \
+#     --poll-interval 30s \
+#     --log-file /local/storage/logs/rclone-blomp.log \
+#     --log-level INFO \
+#     --cache-dir /local/storage/cache/blomp \
+#     --umask 002
