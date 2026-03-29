@@ -17,6 +17,12 @@ contributions/      # Notes on OSS contributions
 |-------|-------------|
 | [Media Server](architecture/media-server/) | Production home media server with automated download pipeline, multi-cloud encrypted storage, and zero-trust web access |
 
+## Contributions
+
+| Project | Description |
+|---------|-------------|
+| [Seerr](contributions/seerr/) | Settings UX standards and audit for upstream proposal |
+
 ## Test Labs
 
 | Lab | Related Issue | Status |
