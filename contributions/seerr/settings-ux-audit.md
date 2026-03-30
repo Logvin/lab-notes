@@ -283,9 +283,18 @@ Add description: "Information about your Seerr installation and available update
 | Mixed heading hierarchy | Metadata | [Heading Hierarchy](settings-ux-standards.md#heading-hierarchy) |
 | No shared components | All form tabs | [Shared Components](settings-ux-standards.md#shared-components) |
 
+## Additional Proposals
+
+These features are defined in the [standards doc](settings-ux-standards.md) and would be implemented as part of the shared component work:
+
+- **[URL Deep Linking](settings-ux-standards.md#url-structure-and-deep-linking)** — Clean tab URLs, section anchors, hover-to-copy link icons
+- **[Copy Settings as Markdown](settings-ux-standards.md#copy-settings-as-markdown)** — One-click copy of settings with automatic redaction of sensitive fields
+- **[Troubleshooting Data](settings-ux-standards.md#troubleshooting-data-about-page)** — Dedicated About page section with copy-to-clipboard for GitHub issue filing
+
 ## Implementation Plan
 
 1. **Phase 1: Standards approval** — Get alignment on the [Settings UX Standards](settings-ux-standards.md) before writing any code
 2. **Phase 2: Shared components** — Create `<SettingsSection>`, `<FormRow>`, `<SettingsActions>` as reusable components
 3. **Phase 3: Reference implementation** — Apply to General as the first tab (most to gain from section grouping)
 4. **Phase 4: Remaining tabs** — One PR per tab, each referencing the standard
+5. **Phase 5: Copy MD and Troubleshooting** — Add copy-as-markdown functionality and About page troubleshooting section
